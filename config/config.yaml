@@ -1,0 +1,10 @@
+# Bot Agent 全局共享配置
+# Go 和 Python 服务共用的配置项
+
+# 环境标识
+env: development # development / staging / production
+
+# gRPC 服务配置（Python 调用 Go 服务时使用）
+grpc:
+  host: "127.0.0.1"
+  port: 50051

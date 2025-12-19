@@ -1,0 +1,282 @@
+syntax = "proto3";
+
+package storage;
+
+option go_package = "bot_agent/gateway/internal/pb";
+
+// ============================================================================
+// 存储服务定义
+// Go 端只负责存储操作，不关心业务语义（中期/长期记忆的区分由业务端控制）
+// ============================================================================
+
+service StorageService {
+  // ======================== MySQL 统一操作 ========================
+  
+  // 批量执行（按顺序执行多个 CRUD 操作，可选事务）
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // ======================== Milvus 统一操作 ========================
+  
+  // 批量执行向量操作（按顺序执行多个 Insert/Search/Delete 操作）
+  rpc ExecuteVector(ExecuteVectorRequest) returns (ExecuteVectorResponse);
+}
+
+// ============================================================================
+// 通用类型定义 - 解决数据类型问题
+// ============================================================================
+
+// 带类型的值，支持多种数据类型
+message TypedValue {
+  oneof value {
+    string string_value = 1; // 字符串
+    int64 int_value = 2; // 整数（包含 int32, int64）
+    double double_value = 3; // 浮点数（包含 float, double）
+    bool bool_value = 4; // 布尔值
+    bytes bytes_value = 5; // 二进制数据
+    int64 timestamp_value = 6; // 时间戳（Unix 毫秒）
+    NullValue null_value = 7; // NULL 值
+  }
+}
+
+// NULL 值枚举
+enum NullValue {
+  NULL_VALUE = 0;
+}
+
+// ============================================================================
+// MySQL 统一批量操作
+// ============================================================================
+
+// 批量执行请求
+message ExecuteRequest {
+  repeated Operation operations = 1; // 操作列表，按顺序执行
+  bool use_transaction = 2; // 是否使用事务（失败自动回滚）
+}
+
+// 单个操作 - 使用 oneof 拆分不同操作类型，解决结构臃肿问题
+message Operation {
+  string database = 1; // 数据库名
+  string table = 2; // 表名
+  
+  oneof operation {
+    InsertOperation insert = 3; // 插入操作
+    UpdateOperation update = 4; // 更新操作
+    DeleteOperation delete = 5; // 删除操作
+    SelectOperation select = 6; // 查询操作
+  }
+}
+
+// ======================== INSERT 操作 ========================
+message InsertOperation {
+  repeated InsertRow rows = 1; // 插入行数据(支持批量插入)
+}
+
+// 插入行数据
+message InsertRow {
+  map<string, TypedValue> fields = 1; // 字段名 -> 带类型的值
+}
+
+// ======================== UPDATE 操作 ========================
+message UpdateOperation {
+  map<string, TypedValue> set_fields = 1; // 要更新的字段（简单赋值）
+  WhereClause where = 2; // WHERE 条件
+  // 原始 SET 子句，支持 SQL 表达式（如 "access_count = access_count + 1, updated_at = NOW()"）
+  // 当 raw_set 不为空时，优先使用 raw_set，忽略 set_fields
+  string raw_set = 3;
+  repeated TypedValue raw_set_params = 4; // raw_set 中占位符(?)对应的参数
+}
+
+// ======================== DELETE 操作 ========================
+message DeleteOperation {
+  WhereClause where = 1; // WHERE 条件（防止误删全表）
+}
+
+// ======================== SELECT 操作 ========================
+message SelectOperation {
+  repeated string fields = 1; // 要返回的字段（空则返回全部）
+  WhereClause where = 2; // WHERE 条件
+  OrderBy order_by = 3; // 排序
+  Pagination pagination = 4; // 分页
+}
+
+// WHERE 条件
+message WhereClause {
+  // 简单等值条件（AND 关系）
+  map<string, TypedValue> conditions = 1;
+  // 复杂 WHERE 子句（当简单条件无法满足时使用）
+  string raw_clause = 2;
+  // 复杂条件的参数（防止 SQL 注入）
+  repeated TypedValue raw_params = 3;
+}
+
+// 排序
+message OrderBy {
+  string field = 1; // 排序字段
+  bool descending = 2; // 是否降序
+}
+
+// 分页
+message Pagination {
+  int32 limit = 1; // 限制数量
+  int32 offset = 2; // 偏移量
+}
+
+// ============================================================================
+// MySQL 执行结果 - 分离不同操作的结果类型
+// ============================================================================
+
+// 批量执行响应
+message ExecuteResponse {
+  repeated OperationResult results = 1; // 每个操作的结果
+  bool success = 2; // 整体是否成功
+  string error = 3; // 错误信息（事务失败时返回）
+}
+
+// 单个操作结果 - 使用 oneof 区分不同类型的结果
+message OperationResult {
+  int32 index = 1; // 对应 operations 中的索引
+  bool success = 2;
+  string error = 3;
+  
+  oneof result {
+    InsertResult insert_result = 4; // 插入结果
+    UpdateResult update_result = 5; // 更新结果
+    DeleteResult delete_result = 6; // 删除结果
+    SelectResult select_result = 7; // 查询结果
+  }
+}
+
+// 插入结果
+message InsertResult {
+  int32 inserted_count = 1; // 成功插入数量
+}
+
+// 更新结果
+message UpdateResult {
+  int32 affected_rows = 1; // 影响行数
+}
+
+// 删除结果
+message DeleteResult {
+  int32 affected_rows = 1; // 影响行数
+}
+
+// 查询结果
+message SelectResult {
+  repeated ResultRow rows = 1; // 查询结果行
+  int32 total = 2; // 总数（用于分页）
+}
+
+// 查询结果行（与 InsertRow 分离，语义清晰）
+message ResultRow {
+  map<string, TypedValue> fields = 1; // 字段名 -> 带类型的值
+}
+
+// ============================================================================
+// Milvus 统一批量操作
+// ============================================================================
+
+// 批量执行向量操作请求
+message ExecuteVectorRequest {
+  repeated VectorOperation operations = 1; // 向量操作列表，按顺序执行
+}
+
+// 单个向量操作 - 使用 oneof 拆分
+message VectorOperation {
+  string collection = 1; // Collection 名称
+  string partition = 2; // Partition 名称（按 bot_id 分区，提升检索效率）
+  
+  oneof operation {
+    VectorInsertOperation insert = 3; // 插入操作
+    VectorSearchOperation search = 4; // 搜索操作
+    VectorDeleteOperation delete = 5; // 删除操作
+    VectorUpsertOperation upsert = 6; // 更新或插入操作
+  }
+}
+
+// ======================== 向量插入操作 ========================
+message VectorInsertOperation {
+  repeated VectorData vectors = 1; // 要插入的向量数据
+}
+
+// ======================== 向量更新或插入操作 ========================
+message VectorUpsertOperation {
+  repeated VectorData vectors = 1; // 要更新或插入的向量数据（ID 存在则更新，否则插入）
+}
+
+// 向量数据
+message VectorData {
+  string id = 1; // 向量 ID
+  repeated float vector = 2; // 向量数据
+  map<string, TypedValue> metadata = 3; // 附加元数据（支持多种类型）
+}
+
+// ======================== 向量搜索操作 ========================
+message VectorSearchOperation {
+  repeated float query_vector = 1; // 查询向量
+  int32 top_k = 2; // 返回数量
+  float min_score = 3; // 最小相似度阈值（可选，0 表示不限制）
+  map<string, TypedValue> filter = 4; // 元数据过滤条件（可选，简单等值条件）
+  string filter_expr = 5; // 复杂过滤表达式（可选，Milvus 表达式语法）
+  repeated string output_fields = 6; // 要返回的 metadata 字段（空则返回全部）
+}
+
+// ======================== 向量删除操作 ========================
+message VectorDeleteOperation {
+  repeated string ids = 1; // 要删除的向量 ID 列表（按 ID 删除）
+  map<string, TypedValue> filter = 2; // 元数据过滤条件（按条件删除，简单等值条件）
+  string filter_expr = 3; // 复杂过滤表达式（按条件删除，Milvus 表达式语法）
+  // 注意：ids 和 filter/filter_expr 二选一，优先使用 ids
+}
+
+// ============================================================================
+// Milvus 执行结果
+// ============================================================================
+
+// 批量执行向量操作响应
+message ExecuteVectorResponse {
+  repeated VectorOperationResult results = 1; // 每个操作的结果
+  bool success = 2; // 整体是否成功
+  string error = 3; // 错误信息
+}
+
+// 单个向量操作结果 - 使用 oneof 区分
+message VectorOperationResult {
+  int32 index = 1; // 对应 operations 中的索引
+  bool success = 2;
+  string error = 3;
+  
+  oneof result {
+    VectorInsertResult insert_result = 4;
+    VectorSearchResult search_result = 5;
+    VectorDeleteResult delete_result = 6;
+    VectorUpsertResult upsert_result = 7;
+  }
+}
+
+// 向量插入结果
+message VectorInsertResult {
+  int32 inserted_count = 1; // 成功插入数量
+}
+
+// 向量更新或插入结果
+message VectorUpsertResult {
+  int32 upserted_count = 1; // 成功更新或插入数量
+}
+
+// 向量搜索结果
+message VectorSearchResult {
+  repeated VectorMatch matches = 1; // 匹配结果
+}
+
+// 向量匹配项
+message VectorMatch {
+  string id = 1; // 向量 ID
+  float score = 2; // 相似度得分
+  map<string, TypedValue> metadata = 3; // 元数据
+}
+
+// 向量删除结果
+message VectorDeleteResult {
+  int32 deleted_count = 1; // 成功删除数量
+}

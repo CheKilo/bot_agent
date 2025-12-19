@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package llm;
+
+option go_package = "bot_agent/gateway/internal/pb";
+
+// LLM 代理服务（适配 Azure OpenAI Chat Completions API）
+service LLMProxyService {
+  // 非流式对话
+  rpc ChatCompletion(ChatCompletionRequest) returns (ChatCompletionResponse);
+  
+  // 流式对话（stream=true）
+  rpc ChatCompletionStream(ChatCompletionRequest) returns (stream ChatCompletionChunk);
+  
+  // 获取 Embedding 向量（用于记忆向量化）
+  rpc GetEmbedding(EmbeddingRequest) returns (EmbeddingResponse);
+}
+
+// ==================== 消息定义 ====================
+
+// 消息内容类型（支持多模态）
+message ContentPart {
+  string type = 1;                     // "text" / "image_url"
+  string text = 2;                     // type="text" 时使用
+  ImageUrl image_url = 3;              // type="image_url" 时使用
+}
+
+message ImageUrl {
+  string url = 1;                      // 图片 URL 或 base64
+  string detail = 2;                   // "low" / "high" / "auto"
+}
+
+message ContentList {
+  repeated ContentPart parts = 1;
+}
+
+// 单条消息（适配 Azure OpenAI 格式）
+message ChatMessage {
+  string role = 1;                     // "system" / "user" / "assistant" / "tool"
+  oneof content_type {
+    string content = 2;                // 简单文本内容
+    ContentList content_parts = 3;     // 多模态内容（图片+文本）
+  }
+  string name = 4;                     // 可选，发送者名称
+  repeated ToolCall tool_calls = 5;    // assistant 的工具调用请求
+  string tool_call_id = 6;             // role="tool" 时，对应的 tool_call id
+}
+
+// ==================== Chat Completion 请求 ====================
+
+message ChatCompletionRequest {
+  // 必填参数
+  string deployment_id = 1;            // 模型部署 ID：gpt-5 / gpt-5-mini / gpt-5-nano / gpt-5-chat
+  string api_version = 2;              // API 版本：2024-05-01-preview
+  repeated ChatMessage messages = 3;   // 对话历史
+  
+  // 可选参数
+  float temperature = 4;               // 温度参数 (0-2)，默认 1
+  int32 max_tokens = 5;                // 最大生成 token 数
+  float top_p = 6;                     // nucleus sampling，默认 1
+  float frequency_penalty = 7;         // 频率惩罚 (-2 到 2)，默认 0
+  float presence_penalty = 8;          // 存在惩罚 (-2 到 2)，默认 0
+  repeated string stop = 9;            // 停止词列表
+  string user = 10;                    // 用户标识（用于滥用检测）
+  
+  // 高级参数
+  int32 n = 11;                        // 返回几个候选回复，默认 1
+  int32 seed = 12;                     // 随机种子（用于可复现结果）
+  string response_format = 13;         // "text" / "json_object"
+  
+  // Function Calling / Tools
+  repeated Tool tools = 14;            // 可用工具列表
+  string tool_choice = 15;             // "none" / "auto" / "required" 或指定工具名
+}
+
+// ==================== Chat Completion 响应 ====================
+
+message ChatCompletionResponse {
+  string id = 1;                       // 请求 ID
+  string object = 2;                   // "chat.completion"
+  int64 created = 3;                   // 创建时间戳
+  string model = 4;                    // 实际使用的模型
+  repeated Choice choices = 5;         // 回复选项
+  Usage usage = 6;                     // token 使用统计
+}
+
+message Choice {
+  int32 index = 1;                     // 选项索引
+  ChatMessage message = 2;             // 回复消息
+  string finish_reason = 3;            // "stop" / "length" / "content_filter" / "tool_calls"
+}
+
+// ==================== 流式响应 ====================
+
+message ChatCompletionChunk {
+  string id = 1;                       // 请求 ID
+  string object = 2;                   // "chat.completion.chunk"
+  int64 created = 3;                   // 创建时间戳
+  string model = 4;                    // 实际使用的模型
+  repeated StreamChoice choices = 5;   // 流式选项
+  Usage usage = 6;                     // token 统计（仅最后一个 chunk 有值）
+}
+
+message StreamChoice {
+  int32 index = 1;                     // 选项索引
+  ChatMessageDelta delta = 2;          // 增量内容
+  string finish_reason = 3;            // 结束原因（仅最后一个 chunk 有值）
+}
+
+message ChatMessageDelta {
+  string role = 1;                     // 角色（仅第一个 chunk 有值）
+  string content = 2;                  // 增量文本内容
+}
+
+// ==================== 通用 ====================
+
+message Usage {
+  int32 prompt_tokens = 1;             // 输入 token 数
+  int32 completion_tokens = 2;         // 输出 token 数
+  int32 total_tokens = 3;              // 总 token 数
+}
+
+// ==================== Function Calling / Tools ====================
+
+// 工具定义
+message Tool {
+  string type = 1;                     // 目前只支持 "function"
+  FunctionDefinition function = 2;    // 函数定义
+}
+
+message FunctionDefinition {
+  string name = 1;                     // 函数名称
+  string description = 2;              // 函数描述
+  string parameters = 3;               // JSON Schema 格式的参数定义（JSON 字符串）
+}
+
+// 工具调用（LLM 返回）
+message ToolCall {
+  string id = 1;                       // 调用 ID
+  string type = 2;                     // "function"
+  FunctionCall function = 3;           // 函数调用详情
+}
+
+message FunctionCall {
+  string name = 1;                     // 函数名称
+  string arguments = 2;                // 函数参数（JSON 字符串）
+}
+
+// ==================== Embedding ====================
+
+message EmbeddingRequest {
+  string deployment_id = 1;            // Embedding 模型部署 ID
+  string api_version = 2;              // API 版本
+  repeated string input = 3;           // 待向量化文本列表
+}
+
+message EmbeddingResponse {
+  string object = 1;                   // "list"
+  string model = 2;                    // 实际使用的模型
+  repeated EmbeddingData data = 3;     // Embedding 数据列表
+  Usage usage = 4;                     // token 使用统计
+}
+
+message EmbeddingData {
+  int32 index = 1;                     // 索引
+  string object = 2;                   // "embedding"
+  repeated float embedding = 3;        // 向量
+}
