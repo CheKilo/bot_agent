@@ -200,11 +200,11 @@ class MemoryAgent(Agent):
         sep = "─" * 50
 
         if event_type == AgentEventType.THOUGHT:
-            logger.info(f"\n{sep}\n💭 [THOUGHT]\n{data.get('thought', '')}")
+            logger.info(f"\n{sep}\n[THOUGHT]\n{data.get('thought', '')}")
 
         elif event_type == AgentEventType.ACTION:
             tool_name = data.get("tool_name", "unknown")
-            logger.info(f"\n{sep}\n🔧 [ACTION] {tool_name}")
+            logger.info(f"\n{sep}\n[ACTION] {tool_name}")
             for k, v in data.get("tool_args", {}).items():
                 v_str = str(v)[:200] + "..." if len(str(v)) > 200 else str(v)
                 logger.info(f"   {k}: {v_str}")
@@ -214,13 +214,13 @@ class MemoryAgent(Agent):
             result_str = result.to_string() if result else ""
             if len(result_str) > 500:
                 result_str = result_str[:500] + "...[截断]"
-            logger.info(f"\n{sep}\n👁️ [OBSERVATION]\n{result_str}")
+            logger.info(f"\n{sep}\n[OBSERVATION]\n{result_str}")
 
         elif event_type == AgentEventType.FINISH:
             answer = data.get("answer", "")
             if len(answer) > 800:
                 answer = answer[:800] + "..."
-            logger.info(f"\n{sep}\n✅ [FINISH]\n{answer}\n{sep}")
+            logger.info(f"\n{sep}\n[FINISH]\n{answer}\n{sep}")
 
     def close(self):
         """关闭资源"""
