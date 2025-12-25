@@ -18,7 +18,7 @@
         }
 
         def execute(self, city: str) -> ToolResult:
-            return ToolResult.success({"city": city, "temp": 25})
+            return ToolResult.ok({"city": city, "temp": 25})
 
     # 使用
     toolkit = ToolKit([GetWeatherTool()])
@@ -52,16 +52,13 @@ class ToolResult:
 
     @classmethod
     def ok(cls, data: Any = None) -> "ToolResult":
-        """创建成功结果"""
         return cls(success=True, data=data)
 
     @classmethod
     def fail(cls, error: str) -> "ToolResult":
-        """创建失败结果"""
         return cls(success=False, error=error)
 
-    def to_string(self) -> str:
-        """转为字符串（返回给 LLM）"""
+    def __str__(self) -> str:
         if not self.success:
             return f"Error: {self.error}"
         if self.data is None:
@@ -73,9 +70,6 @@ class ToolResult:
         except (TypeError, ValueError):
             return str(self.data)
 
-    def __str__(self) -> str:
-        return self.to_string()
-
 
 # ============================================================================
 # 工具基类
@@ -83,27 +77,37 @@ class ToolResult:
 
 
 class Tool(ABC):
-    """
-    工具基类
-
-    子类必须定义：name, description, parameters
-    并实现 execute 方法
-    """
+    """工具基类，子类需定义 name/description/parameters 并实现 execute"""
 
     name: str = ""
     description: str = ""
     parameters: Dict[str, Any] = {}
 
     def __init__(self):
-        if not self.name:
-            raise ValueError(f"{self.__class__.__name__} must define 'name'")
-        if not self.description:
-            raise ValueError(f"{self.__class__.__name__} must define 'description'")
+        assert self.name, f"{self.__class__.__name__} must define 'name'"
+        assert self.description, f"{self.__class__.__name__} must define 'description'"
 
     @abstractmethod
     def execute(self, **kwargs) -> ToolResult:
         """执行工具"""
         pass
+
+    def safe_execute(self, **kwargs) -> ToolResult:
+        """安全执行（带异常捕获）"""
+        try:
+            # 调试日志：打印接收到的参数
+            logger.info(f"[{self.name}] 接收参数: {list(kwargs.keys())}")
+            logger.debug(f"[{self.name}] 参数详情: {kwargs}")
+            return self.execute(**kwargs)
+        except TypeError as e:
+            # 参数不匹配错误，给出更详细的提示
+            logger.error(
+                f"Tool {self.name} 参数错误: {e}, 接收到的参数: {list(kwargs.keys())}"
+            )
+            return ToolResult.fail(f"参数错误: {e}. 接收到: {list(kwargs.keys())}")
+        except Exception as e:
+            logger.exception(f"Tool {self.name} execution failed")
+            return ToolResult.fail(f"Execution error: {e}")
 
     def to_schema(self) -> Dict[str, Any]:
         """转换为 OpenAI Function Calling 格式"""
@@ -115,14 +119,6 @@ class Tool(ABC):
                 "parameters": self.parameters,
             },
         }
-
-    def safe_execute(self, **kwargs) -> ToolResult:
-        """安全执行（带异常捕获）"""
-        try:
-            return self.execute(**kwargs)
-        except Exception as e:
-            logger.exception(f"Tool {self.name} execution failed")
-            return ToolResult.fail(f"Execution error: {e}")
 
     def __repr__(self) -> str:
         return f"Tool({self.name})"
@@ -208,6 +204,37 @@ class ToolKit:
     def names(self) -> List[str]:
         return list(self._tools.keys())
 
+    def get_names_str(self) -> str:
+        """获取所有工具名称的逗号分隔字符串"""
+        return ", ".join(self._tools.keys())
+
+    def get_descriptions(self, format_style: str = "markdown") -> str:
+        """
+        生成工具描述文本（用于 ReAct prompt）
+
+        Args:
+            format_style: 格式风格，支持 "markdown" 或 "plain"
+
+        Returns:
+            格式化的工具描述字符串
+        """
+        if not self._tools:
+            return ""
+
+        lines = []
+        for tool in self._tools.values():
+            if format_style == "markdown":
+                params_str = json.dumps(tool.parameters, ensure_ascii=False, indent=2)
+                lines.append(
+                    f"### {tool.name}\n{tool.description}\n参数: {params_str}\n"
+                )
+            else:
+                # plain 格式，更紧凑
+                params_str = json.dumps(tool.parameters, ensure_ascii=False)
+                lines.append(f"{tool.name}: {tool.description} 参数: {params_str}")
+
+        return "\n".join(lines)
+
     def __len__(self) -> int:
         return len(self._tools)
 
@@ -280,7 +307,7 @@ class ToolCall:
     ) -> Dict[str, Any]:
         """格式化工具结果为 LLM 消息"""
         if isinstance(result, ToolResult):
-            content = result.to_string()
+            content = str(result)
         elif isinstance(result, str):
             content = result
         else:

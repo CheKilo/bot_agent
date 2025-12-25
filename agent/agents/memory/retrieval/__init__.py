@@ -9,7 +9,7 @@
 """
 
 from agent.agents.memory.retrieval.bm25 import BM25, tokenize
-from agent.agents.memory.retrieval.query_rewriter import QueryRewriter
+from agent.agents.memory.retrieval.query_rewriter import QueryRewriter, RewriteResult
 from agent.agents.memory.retrieval.ranker import Ranker, RankItem
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "tokenize",
     # Query 改写
     "QueryRewriter",
+    "RewriteResult",
     # 排序
     "Ranker",
     "RankItem",

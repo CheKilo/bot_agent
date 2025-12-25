@@ -46,8 +46,10 @@ from agent.agents.memory.config import (
 )
 from agent.agents.memory.retrieval import (
     QueryRewriter,
+    RewriteResult,
     Ranker,
     RankItem,
+    BM25,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,23 +104,10 @@ class MemoryManager:
         self._partition = get_milvus_partition(bot_id)
 
         # 子模块（懒加载）
-        self._summary_llm: Optional[LLM] = None
         self._query_rewriter: Optional[QueryRewriter] = None
         self._ranker: Optional[Ranker] = None
 
     # ========== 子模块懒加载 ==========
-
-    @property
-    def summary_llm(self) -> LLM:
-        """摘要生成 LLM"""
-        if self._summary_llm is None:
-            cfg = self.config.summary_llm
-            self._summary_llm = LLM(
-                address=cfg.address,
-                model=cfg.model,
-                timeout=cfg.timeout,
-            )
-        return self._summary_llm
 
     @property
     def query_rewriter(self) -> QueryRewriter:
@@ -134,49 +123,34 @@ class MemoryManager:
             self._ranker = Ranker(self.config.ranker)
         return self._ranker
 
-    # ========== 摘要存储（新接口） ==========
+    # ========== 中期记忆存储 ==========
 
-    def save_summary(
-        self, messages: List[Dict[str, str]], raw_messages: Optional[List[Dict]] = None
+    def save_mid_term_memory(
+        self,
+        summary: str,
+        keywords: str,
+        raw_messages: List[Dict[str, str]],
     ) -> bool:
         """
-        保存消息摘要到中期记忆
+        保存中期记忆（纯存储，不生成摘要）
 
         Args:
-            messages: 用于生成摘要的消息列表，格式为 {"role": "user/assistant", "content": "..."}
-            raw_messages: 完整的原始消息列表（包含 tool 消息等），如果不传则使用 messages
+            summary: 摘要内容（由调用方生成）
+            keywords: 关键词（由调用方提取）
+            raw_messages: 原始消息列表
 
         Returns:
             是否保存成功
         """
-        if not messages:
+        if not summary or not raw_messages:
             return False
 
         try:
-            # 构建对话文本
-            conversation = "\n".join(
-                [
-                    f"[{m.get('role', 'unknown')}]: {m.get('content', '')}"
-                    for m in messages
-                ]
-            )
-
-            # 生成摘要和关键词
-            summary, keywords = self._generate_summary(conversation)
-            if not summary:
-                logger.warning("Failed to generate summary")
-                return False
-
-            # 保存到 MySQL（raw_messages 保存完整对话，如果没有则用 messages）
-            raw_to_save = raw_messages if raw_messages is not None else messages
-            self._save_to_mysql(messages, summary, keywords, raw_to_save)
-            logger.info(
-                f"Mid-term memory saved: {len(raw_to_save)} messages (summary from {len(messages)} dialog turns)"
-            )
+            self._save_to_mysql(raw_messages, summary, keywords, raw_messages)
+            logger.info(f"Mid-term memory saved: {len(raw_messages)} messages")
             return True
-
         except Exception as e:
-            logger.error(f"Failed to save summary: {e}")
+            logger.error(f"Failed to save mid-term memory: {e}")
             return False
 
     def get_recent_summaries(self, count: Optional[int] = None) -> List[Dict]:
@@ -223,37 +197,91 @@ class MemoryManager:
             logger.error(f"Failed to get recent summaries: {e}")
             return []
 
-    # ========== 中期记忆检索 ==========
+    # ========== 统一检索入口 ==========
 
-    def search_mid_term(
+    def search_all(
         self,
         query: str,
-        time_range_days: int = 30,
+        time_range_days: int = 90,
+        limit: int = 5,
+        min_importance: int = 1,
+    ) -> Dict[str, List]:
+        """
+        统一检索入口：同时搜索中期和长期记忆
+
+        流程：
+        1. 统一改写（一次 LLM 调用）
+        2. 并行召回（中期 + 长期）
+        3. 分别精排（因排序因子不同）
+        4. 返回分层结果
+
+        Returns:
+            {
+                "mid_term": [SearchResult, ...],
+                "long_term": [{...}, ...],
+            }
+        """
+        if not query or not query.strip():
+            return {"mid_term": [], "long_term": []}
+
+        # 1. 统一改写
+        rewrite_result = self.query_rewriter.rewrite_unified(query)
+        logger.debug(
+            f"Rewrite result: mid_term_query={rewrite_result.mid_term_query}, "
+            f"mid_term_keywords={rewrite_result.mid_term_keywords}, "
+            f"long_term_query={rewrite_result.long_term_query}"
+        )
+
+        # 2. 并行检索（这里串行实现，后续可改为并行）
+        mid_results = self._search_mid_term_internal(
+            rewrite_result=rewrite_result,
+            time_range_days=time_range_days,
+            limit=limit,
+        )
+
+        long_results = self._search_long_term_internal(
+            rewrite_result=rewrite_result,
+            limit=limit,
+            min_importance=min_importance,
+        )
+
+        return {
+            "mid_term": mid_results,
+            "long_term": long_results,
+        }
+
+    # ========== 中期记忆检索 ==========
+
+    def _search_mid_term_internal(
+        self,
+        rewrite_result: RewriteResult,
+        time_range_days: int = 90,
         limit: int = 5,
     ) -> List[SearchResult]:
         """
-        搜索中期记忆
+        中期记忆检索（内部方法）
 
-        流程：改写(+时间具化) → 召回 → BM25粗排 → 精排
-
-        注意：只检索 MySQL 中的摘要，不再包含缓冲区
+        改进：
+        - 使用多关键词多路召回
+        - 合并去重后精排
         """
-        if not query or not query.strip():
-            return []
-
-        # 1. Query 改写（中期模式：改写 + 时间具化）
-        rewritten_query = self.query_rewriter.rewrite_for_mid_term(query)
-        logger.debug(f"Mid-term rewritten query: {rewritten_query}")
-
-        # 2. 从 MySQL 召回
+        # 1. 从 MySQL 召回
         rank_items = self._recall_mysql(time_range_days=time_range_days)
         logger.debug(f"MySQL recall: {len(rank_items)} items")
         if not rank_items:
             return []
 
+        # 2. 多关键词 BM25 召回合并
+        # 构建联合查询：主 query + 扩展关键词
+        combined_query = rewrite_result.mid_term_query
+        if rewrite_result.mid_term_keywords:
+            combined_query += " " + " ".join(rewrite_result.mid_term_keywords)
+
+        logger.debug(f"Mid-term combined query: {combined_query}")
+
         # 3. 粗排 + 精排
         ranked = self.ranker.rank(
-            query=rewritten_query,
+            query=combined_query,
             items=rank_items,
             limit=limit,
         )
@@ -367,27 +395,6 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(f"Failed to update access_count for {rid}: {e}")
 
-    # ========== 摘要生成 ==========
-
-    def _generate_summary(self, conversation: str) -> tuple:
-        """生成摘要和关键词"""
-        prompt = f"""对话内容：
-{conversation}
-
-提取摘要(200字内)和关键词，JSON格式返回：
-{{"summary": "摘要", "keywords": "关键词1,关键词2"}}"""
-
-        response = self.summary_llm.chat(
-            [{"role": "user", "content": prompt}],
-            temperature=0.3,
-        )
-
-        try:
-            result = json.loads(response.content)
-            return result.get("summary", ""), result.get("keywords", "")
-        except json.JSONDecodeError:
-            return response.content[:500] if response.content else "", ""
-
     def _save_to_mysql(
         self,
         messages: List[Dict[str, str]],
@@ -496,32 +503,28 @@ class MemoryManager:
 
     # ========== 长期记忆检索 ==========
 
-    def search_long_term(
+    def _search_long_term_internal(
         self,
-        query: str,
+        rewrite_result: RewriteResult,
         memory_type: str = "all",
         limit: int = 5,
-        min_score: float = 0.1,  # 从 0.3 降低到 0.1
+        min_score: float = 0.1,
         min_importance: int = 1,
     ) -> List[Dict]:
         """
-        搜索长期记忆
+        长期记忆检索（内部方法）
 
-        流程：精简改写 → 向量召回 → 精排
+        改进：
+        - 使用精简后的语义 query 进行向量召回
+        - 使用关键词增强精排
         """
-        if not query or not query.strip():
-            return []
-
-        # 1. 精简改写（长期模式：保持语义纯净）
-        rewritten_query = self.query_rewriter.rewrite_for_long_term(query)
-
-        # 2. 向量化
-        vector = self.embed_func(rewritten_query)
+        # 1. 向量化（使用精简后的 query）
+        vector = self.embed_func(rewrite_result.long_term_query)
         if not vector:
             logger.warning("Failed to embed query")
             return []
 
-        # 3. 向量召回
+        # 2. 向量召回
         try:
             raw_results = self._vector_recall(
                 query_vector=vector,
@@ -537,17 +540,20 @@ class MemoryManager:
         if not raw_results:
             return []
 
-        # 4. 转换为 RankItem
+        # 3. 转换为 RankItem
         rank_items = self._to_long_term_rank_items(raw_results)
 
-        # 5. 精排（传入 query 用于上下文匹配增强）
-        ranked = self.ranker.rank_long_term(
-            rewritten_query, rank_items, limit=limit * 2
-        )
+        # 4. 精排（使用关键词增强）
+        # 合并 query 和关键词用于上下文匹配
+        rank_query = rewrite_result.long_term_query
+        if rewrite_result.long_term_keywords:
+            rank_query += " " + " ".join(rewrite_result.long_term_keywords)
+
+        ranked = self.ranker.rank_long_term(rank_query, rank_items, limit=limit * 2)
 
         logger.debug(f"After ranking: {len(ranked)} items")
 
-        # 5.1 去重（相同内容保留分数最高的）
+        # 5. 去重
         ranked = self._dedupe_long_term(ranked)
         logger.debug(f"After dedup: {len(ranked)} items")
 
@@ -803,9 +809,6 @@ class MemoryManager:
         # 关闭前执行记忆提升
         self.promote_high_frequency()
 
-        if self._summary_llm:
-            self._summary_llm.close()
-            self._summary_llm = None
         if self._query_rewriter:
             self._query_rewriter.close()
             self._query_rewriter = None

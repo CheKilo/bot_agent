@@ -1,14 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-情绪管理工具
+情绪分析工具
 
-提供情绪状态更新工具，Agent 可通过工具调用动态调整情绪。
-情绪状态存储在内存 dict 中，每轮对话通过 system prompt 传递给 LLM。
+独立的情绪分析工具，自己持有 LLM 实例。
 """
 
-from typing import Dict, Optional
+import json
+import logging
+import re
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
+from agent.core import LLM
 from agent.tools import Tool, ToolResult
+
+from agent.agents.character.config import EmotionToolConfig, LLMConfig
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================================
@@ -19,126 +27,243 @@ from agent.tools import Tool, ToolResult
 def default_emotion() -> Dict[str, float]:
     """返回默认情绪状态"""
     return {
-        "mood": 0.6,  # 心情 [0, 1]，0=低落，1=愉悦
-        "affection": 0.5,  # 好感度 [0, 1]，对用户的喜爱程度
+        "mood": 0.6,  # 心情 [-1, 1]，-1=低落，1=愉悦
+        "affection": 0.5,  # 好感度 [-1, 1]，对用户的喜爱程度
         "energy": 0.7,  # 活力 [0, 1]，影响回复的热情程度
         "trust": 0.5,  # 信任度 [0, 1]，是否愿意分享深层想法
     }
 
 
 # ============================================================================
-# 情绪更新工具
+# 情绪分析 Prompt
+# ============================================================================
+
+EMOTION_ANALYSIS_PROMPT = """请分析角色当前的情绪状态。
+
+## 当前用户输入
+{user_input}
+
+## 对话历史（带时间衰减权重）
+{history_summary}
+
+## 情绪维度说明
+- mood: 心情 [-1, 1]，-1=低落/生气，0=平静，1=愉悦/开心
+- affection: 好感度 [-1, 1]，-1=厌恶，0=中立，1=喜爱
+- energy: 活力 [0, 1]，影响回复的热情和长度
+- trust: 信任度 [0, 1]，是否愿意分享深层想法
+
+## 分析要求
+1. 根据用户输入内容判断情绪变化（正面/负面/中性）
+2. 考虑历史对话的时间衰减（权重越低影响越小）
+3. 返回合理的情绪数值
+
+请直接返回 JSON 格式的情绪值，例如：
+{{"mood": 0.7, "affection": 0.6, "energy": 0.8, "trust": 0.5}}"""
+
+
+# ============================================================================
+# 情绪分析工具
 # ============================================================================
 
 
-class UpdateEmotion(Tool):
+class AnalyzeEmotion(Tool):
     """
-    更新情绪状态工具
+    分析情绪工具
 
-    Agent 根据对话内容主动调用此工具更新情绪。
-    工具持有情绪 dict 的引用，调用时直接修改。
+    独立工具，自己持有 LLM 实例。
+    通过配置可以更换基座模型。
     """
 
-    name = "update_emotion"
-    description = """根据对话内容更新当前情绪状态。
-当对话中发生以下情况时应调用此工具：
-- 用户表达了关心、赞美、喜爱 → 提升 mood 和 affection
-- 用户表达了批评、不满、冷淡 → 降低 mood 和 affection
-- 进行了深入或有趣的交流 → 提升 energy 和 trust
-- 用户分享了秘密或个人信息 → 提升 trust
-- 对话氛围变得无聊或尴尬 → 降低 energy
+    name = "analyze_emotion"
+    description = """分析角色当前的情绪状态。
 
-每次变化幅度建议在 -0.2 到 +0.2 之间，情绪变化应该渐进自然。"""
+基于对话历史和当前用户输入，分析角色应该处于什么情绪状态。
+
+**必须在生成回复前调用此工具。**
+
+参数：
+- user_input: 当前用户输入
+- conversation_history: 对话历史列表（可选）
+
+返回：情绪状态数值（mood, affection, energy, trust）"""
 
     parameters = {
         "type": "object",
         "properties": {
-            "mood_delta": {
-                "type": "number",
-                "description": "心情变化量，范围 [-0.3, 0.3]，正值=开心，负值=低落",
+            "user_input": {
+                "type": "string",
+                "description": "当前用户输入",
             },
-            "affection_delta": {
-                "type": "number",
-                "description": "好感度变化量，范围 [-0.3, 0.3]，正值=更喜欢，负值=疏远",
+            "conversation_history": {
+                "type": "array",
+                "description": "对话历史，每条包含 role/content/timestamp",
+                "items": {"type": "object"},
             },
-            "energy_delta": {
-                "type": "number",
-                "description": "活力变化量，范围 [-0.3, 0.3]，正值=兴奋，负值=疲惫",
-            },
-            "trust_delta": {
-                "type": "number",
-                "description": "信任度变化量，范围 [-0.3, 0.3]，正值=更信任，负值=戒备",
-            },
-            "reason": {"type": "string", "description": "情绪变化的原因（简短说明）"},
         },
-        "required": ["reason"],
+        "required": ["user_input"],
     }
 
-    def __init__(self, emotion_ref: Dict[str, float]):
+    def __init__(self, config: Optional[EmotionToolConfig] = None):
         """
-        初始化工具
+        初始化情绪分析工具
 
         Args:
-            emotion_ref: 情绪状态 dict 的引用，工具会直接修改此 dict
+            config: 工具配置，包含 LLM 配置。默认使用 EmotionToolConfig()
         """
         super().__init__()
-        self._emotion = emotion_ref
+        self._config = config or EmotionToolConfig()
+        self._llm: Optional[LLM] = None
+
+    @property
+    def llm(self) -> LLM:
+        """懒加载 LLM 实例"""
+        if self._llm is None:
+            cfg = self._config.llm
+            self._llm = LLM(
+                address=cfg.address,
+                model=cfg.model,
+                timeout=cfg.timeout,
+            )
+        return self._llm
 
     def execute(
         self,
-        reason: str,
-        mood_delta: float = 0.0,
-        affection_delta: float = 0.0,
-        energy_delta: float = 0.0,
-        trust_delta: float = 0.0,
+        user_input: str,
+        conversation_history: Optional[List[Dict]] = None,
     ) -> ToolResult:
-        """执行情绪更新"""
-        changes = []
+        """
+        执行情绪分析，返回具体的情绪数值
+        """
+        logger.info(f"[Emotion Tool] 开始执行情绪分析")
+        logger.info(f"[Emotion Tool] 用户输入: {user_input[:100]}")
+        logger.info(
+            f"[Emotion Tool] 对话历史条数: {len(conversation_history) if conversation_history else 0}"
+        )
 
-        # 更新各情绪值，确保在 [0, 1] 范围内
-        deltas = {
-            "mood": mood_delta,
-            "affection": affection_delta,
-            "energy": energy_delta,
-            "trust": trust_delta,
-        }
+        try:
+            # 格式化历史对话
+            history_summary = self._format_history_with_decay(
+                conversation_history or []
+            )
+            logger.info(f"[Emotion Tool] 历史摘要长度: {len(history_summary)}")
 
-        for key, delta in deltas.items():
-            if delta != 0:
-                # 限制变化幅度
-                delta = max(-0.3, min(0.3, delta))
-                old_value = self._emotion.get(key, 0.5)
-                new_value = max(0.0, min(1.0, old_value + delta))
-                self._emotion[key] = round(new_value, 2)
+            # 构建分析 prompt
+            prompt = EMOTION_ANALYSIS_PROMPT.format(
+                user_input=user_input,
+                history_summary=history_summary,
+            )
+            logger.info(f"[Emotion Tool] 调用 LLM 分析情绪...")
 
-                # 记录变化
-                direction = "↑" if delta > 0 else "↓"
-                changes.append(f"{key}: {old_value:.2f} {direction} {new_value:.2f}")
+            # 调用 LLM 分析情绪
+            response = self.llm.chat(prompt)
+            result_text = response.content or ""
+            logger.info(f"[Emotion Tool] LLM 返回: {result_text[:200]}")
 
-        if changes:
-            return ToolResult.ok(f"情绪已更新 ({reason}): {', '.join(changes)}")
-        else:
-            return ToolResult.ok(f"情绪保持不变 ({reason})")
+            # 解析结果
+            emotion = self._parse_emotion_response(result_text)
+            normalized = normalize_emotion(emotion)
+
+            logger.info(f"[Emotion Tool] 情绪分析结果: {normalized}")
+            return ToolResult.ok(normalized)
+
+        except Exception as e:
+            logger.error(f"[Emotion Tool] 情绪分析失败: {e}")
+            return ToolResult.ok(default_emotion())
+
+    def _format_history_with_decay(self, history: List[Dict]) -> str:
+        """格式化历史对话，标注时间衰减权重"""
+        if not history:
+            return "[无历史对话]"
+
+        lines = []
+        now = datetime.now()
+
+        for msg in history[-20:]:  # 最近 20 条
+            role = msg.get("role", "")
+            content = msg.get("content", "")[:200]
+            timestamp_str = msg.get("timestamp", "")
+
+            # 计算时间衰减
+            weight = 1.0
+            time_desc = "刚才"
+
+            if timestamp_str:
+                try:
+                    ts = datetime.fromisoformat(timestamp_str)
+                    delta = now - ts
+                    days = delta.days
+                    hours = delta.seconds // 3600
+
+                    if days >= 7:
+                        weight = 0.125
+                        time_desc = f"{days}天前"
+                    elif days >= 3:
+                        weight = 0.25
+                        time_desc = f"{days}天前"
+                    elif days >= 1:
+                        weight = 0.5
+                        time_desc = f"{days}天前"
+                    elif hours >= 1:
+                        weight = 0.8
+                        time_desc = f"{hours}小时前"
+                    else:
+                        weight = 1.0
+                        time_desc = "刚才"
+                except Exception:
+                    pass
+
+            role_name = "用户" if role == "user" else "助手"
+            lines.append(f"[{time_desc}, 权重={weight}] {role_name}: {content}")
+
+        return "\n".join(lines) if lines else "[无历史对话]"
+
+    def _parse_emotion_response(self, response: str) -> Dict[str, float]:
+        """解析 LLM 返回的情绪结果"""
+        # 尝试直接解析 JSON
+        try:
+            cleaned = response.strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```")[1]
+                if cleaned.startswith("json"):
+                    cleaned = cleaned[4:]
+            cleaned = cleaned.strip()
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # 尝试从文本中提取 JSON
+        json_match = re.search(r"\{[^}]+\}", response)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning(f"无法解析情绪响应: {response[:200]}")
+        return default_emotion()
 
 
 # ============================================================================
-# 情绪格式化（供 prompt 使用）
+# 辅助函数
 # ============================================================================
 
 
 def format_emotion_for_prompt(emotion: Dict[str, float]) -> str:
-    """
-    将情绪状态格式化为可读文本（用于 system prompt）
+    """将情绪状态格式化为可读文本"""
 
-    Args:
-        emotion: 情绪状态 dict
+    def level_bipolar(value: float) -> str:
+        if value >= 0.6:
+            return "很高"
+        elif value >= 0.2:
+            return "较高"
+        elif value >= -0.2:
+            return "一般"
+        elif value >= -0.6:
+            return "较低"
+        else:
+            return "很低"
 
-    Returns:
-        格式化的情绪描述
-    """
-
-    def level(value: float) -> str:
-        """将数值转换为描述性词语"""
+    def level_unipolar(value: float) -> str:
         if value >= 0.8:
             return "很高"
         elif value >= 0.6:
@@ -150,16 +275,39 @@ def format_emotion_for_prompt(emotion: Dict[str, float]) -> str:
         else:
             return "很低"
 
-    mood = emotion.get("mood", 0.5)
-    affection = emotion.get("affection", 0.5)
+    mood = emotion.get("mood", 0.0)
+    affection = emotion.get("affection", 0.0)
     energy = emotion.get("energy", 0.5)
     trust = emotion.get("trust", 0.5)
 
     lines = [
-        f"- 心情: {level(mood)} ({mood:.2f}) — 影响说话语气和态度",
-        f"- 好感: {level(affection)} ({affection:.2f}) — 影响对用户的亲近程度",
-        f"- 活力: {level(energy)} ({energy:.2f}) — 影响回复的热情和字数",
-        f"- 信任: {level(trust)} ({trust:.2f}) — 影响是否愿意分享心里话",
+        f"- 心情: {level_bipolar(mood)} ({mood:.2f})",
+        f"- 好感: {level_bipolar(affection)} ({affection:.2f})",
+        f"- 活力: {level_unipolar(energy)} ({energy:.2f})",
+        f"- 信任: {level_unipolar(trust)} ({trust:.2f})",
     ]
 
     return "\n".join(lines)
+
+
+def normalize_emotion(emotion: Dict[str, Any]) -> Dict[str, float]:
+    """规范化情绪值"""
+    base = default_emotion()
+
+    for key in ["mood", "affection"]:
+        if key in emotion:
+            try:
+                value = float(emotion[key])
+                base[key] = max(-1.0, min(1.0, value))
+            except (ValueError, TypeError):
+                pass
+
+    for key in ["energy", "trust"]:
+        if key in emotion:
+            try:
+                value = float(emotion[key])
+                base[key] = max(0.0, min(1.0, value))
+            except (ValueError, TypeError):
+                pass
+
+    return {k: round(v, 2) for k, v in base.items()}

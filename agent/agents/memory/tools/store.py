@@ -44,7 +44,7 @@ class StoreLongTermMemory(Tool):
         self._manager = manager
 
     def execute(
-        self, content: str, memory_type: str, importance: int = 5
+        self, content: str, memory_type: str, importance: int = 5, **kwargs
     ) -> ToolResult:
         if not content or not content.strip():
             return ToolResult.fail("存储内容不能为空")

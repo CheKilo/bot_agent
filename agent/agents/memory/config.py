@@ -31,7 +31,6 @@ DEFAULT_MIN_SCORE = 0.3
 # ========== LLM 配置 ==========
 DEFAULT_LLM_ADDRESS = "localhost:50051"
 DEFAULT_LLM_TIMEOUT = 10.0
-SUMMARY_LLM_MODEL = "gpt-4o-mini"
 QUERY_LLM_MODEL = "gpt-4o-mini"
 
 # ========== 排序器配置 ==========
@@ -69,11 +68,6 @@ class RankerConfig:
 @dataclass
 class MemoryConfig:
     """记忆管理器配置"""
-
-    # 摘要 LLM
-    summary_llm: LLMConfig = field(
-        default_factory=lambda: LLMConfig(model=SUMMARY_LLM_MODEL)
-    )
 
     # Query 改写器
     query_rewriter: QueryRewriterConfig = field(default_factory=QueryRewriterConfig)
