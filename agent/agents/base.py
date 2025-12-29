@@ -30,6 +30,8 @@ DEFAULT_MESSAGE_WINDOW = 20
 REACT_FORMAT_TEMPLATE = """
 ## 输出格式（必须严格遵守）
 
+**重要：每次只能输出一步操作，不能预测后续步骤！**
+
 每次回复必须包含以下三行（缺一不可）：
 ```
 Thought: [你的思考]
@@ -43,26 +45,32 @@ Thought: 已完成所有必要的工具调用
 Final Answer: [最终答案]
 ```
 
-## 格式示例
+## 关键约束（必须遵守）
+1. **每次只输出一步**：输出 Action 后立即停止，等待 Observation 返回后再继续
+2. **禁止预测后续步骤**：不要在一次回复中输出多个 Thought/Action/Final Answer
+3. **Thought 后必须紧跟 Action**：不能只输出 Thought 就结束
+4. **必须先调用工具**：在输出 Final Answer 之前，必须至少调用一次工具
+5. **格式必须精确**：Action: 和 Action Input: 必须各占一行
+6. **Action 和 Final Answer 不能同时出现**
 
-### 正确示例 ✓
+## 正确示例 ✓
 ```
 Thought: 我需要先检索相关记忆
 Action: call_agent
 Action Input: {{"agent_name": "memory_agent", "input": "用户的问题"}}
 ```
+（然后停止，等待 Observation）
 
-### 错误示例 ✗（只有 Thought 没有 Action）
+## 错误示例 ✗（一次输出多步）
 ```
 Thought: 我需要先检索相关记忆
+Action: call_agent
+Action Input: {{...}}
+Thought: 现在生成回复      ← 错误！不要预测后续步骤
+Action: generate_response
+Action Input: {{...}}
+Final Answer: ...           ← 错误！必须等待每个工具的 Observation
 ```
-这是错误的！Thought 后面必须紧跟 Action 和 Action Input。
-
-## 强制规则
-1. **Thought 后必须紧跟 Action**：不能只输出 Thought 就结束
-2. **必须先调用工具**：在输出 Final Answer 之前，必须至少调用一次工具
-3. **格式必须精确**：Action: 和 Action Input: 必须各占一行
-4. Action 和 Final Answer 不能同时出现
 """
 
 
@@ -123,7 +131,10 @@ class Agent(ABC):
         self._message_window = message_window or DEFAULT_MESSAGE_WINDOW
 
         # 持久化对话历史（有状态 Agent 使用）
-        self._messages: List[Dict] = []
+        # 注意：如果子类在 super().__init__() 之前已创建 _messages，则不覆盖
+        # 这是为了让子类可以传递 _messages 引用给工具（如 CallAgentTool）
+        if not hasattr(self, "_messages"):
+            self._messages: List[Dict] = []
 
         # 单轮 ReAct 轨迹（每次 run 重置，记录完整的 thought/action/observation）
         self._loop_messages: List[Dict] = []
@@ -165,6 +176,33 @@ class Agent(ABC):
         """事件回调（子类可覆盖）"""
         logger.debug(f"[{self.name}] {event_type.value}: {data}")
 
+    # ==================== 生命周期钩子 ====================
+    # 子类可重写这些方法来在特定时机执行自定义逻辑
+
+    def _on_user_input(self, user_input: str):
+        """
+        用户输入到达时的回调（在 ReAct 循环开始前）
+
+        时机：run() 开始时，_init_loop() 之前
+        用途：记录用户输入到对话历史、预处理等
+
+        Args:
+            user_input: 用户原始输入
+        """
+        pass
+
+    def _on_final_answer(self, answer: str):
+        """
+        最终答案生成后的回调（在 ReAct 循环结束后）
+
+        时机：Final Answer 解析完成后
+        用途：记录 assistant 回复到对话历史、触发摘要等
+
+        Args:
+            answer: 最终答案（已经过 _finalize_output 处理）
+        """
+        pass
+
     # ==================== 属性 ====================
 
     @property
@@ -197,6 +235,9 @@ class Agent(ABC):
 
     def run(self, user_input: str) -> AgentResult:
         """执行 ReAct 循环"""
+        # 生命周期钩子：用户输入到达
+        self._on_user_input(user_input)
+
         self._init_loop(user_input)
 
         for _, result in self._react_loop():
@@ -207,6 +248,9 @@ class Agent(ABC):
 
     def run_stream(self, user_input: str) -> Generator[str, None, AgentResult]:
         """流式执行 ReAct 循环"""
+        # 生命周期钩子：用户输入到达
+        self._on_user_input(user_input)
+
         self._init_loop(user_input)
 
         for chunk, result in self._react_loop(use_stream_final=True):
@@ -275,6 +319,9 @@ Final Answer: 最终答案
         初始化单轮 ReAct 循环（子类可重写）
 
         重置 _loop_messages，开始新的 ReAct 轨迹
+
+        注意：如需在循环开始前执行逻辑（如记录用户输入），
+        请重写 _on_user_input() 而非此方法
         """
         self._loop_messages = [
             {"role": "system", "content": self._build_system_prompt()},
@@ -440,10 +487,6 @@ Action Input: {"agent_name": "memory_agent", "input": "用户的问题", "metada
             error="Exceeded max iterations",
         )
 
-    def _on_final_answer(self, answer: str):
-        """最终答案生成后的回调（子类可重写）"""
-        pass
-
     def _parse_react_output(self, content: str) -> Dict[str, Any]:
         """解析 ReAct 格式输出"""
         result = {
@@ -495,6 +538,17 @@ Action Input: {"agent_name": "memory_agent", "input": "用户的问题", "metada
                         logger.warning(
                             f"[{self.name}] 回退为纯文本参数: input={input_str[:100]}"
                         )
+
+            # 检查是否存在多步输出（LLM 一次性输出了整个流程）
+            # 通过检测是否有多个 Thought 或 Final Answer 来判断
+            thought_count = len(re.findall(r"Thought:", content, re.IGNORECASE))
+            has_final_in_content = re.search(r"Final Answer:", content, re.IGNORECASE)
+
+            if thought_count > 1 or has_final_in_content:
+                logger.warning(
+                    f"[{self.name}] 检测到 LLM 一次性输出了多步操作（{thought_count} 个 Thought），"
+                    f"只执行第一个 Action，后续内容将被忽略"
+                )
 
             # 如果有 Action，不解析 Final Answer（它们不应该同时出现）
             return result

@@ -104,11 +104,10 @@ class CallAgentTool(CallAgent):
             )
 
         try:
-            # 自动注入 conversation_history（排除当前轮次的用户输入）
-            conversation_history = []
-            if len(self._messages_ref) >= 2:
-                # 排除最后两条（当前用户输入和即将生成的回复）
-                conversation_history = self._messages_ref[:-1]
+            # 自动注入 conversation_history
+            # 注意：当前用户输入已在 SystemAgent._init_loop 中添加到 _messages
+            # 所以这里直接传递完整的历史（包含当前用户输入）
+            conversation_history = list(self._messages_ref)
 
             # 构造 metadata（合并自动注入的和手动传入的）
             metadata = kwargs.copy()

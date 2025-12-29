@@ -332,10 +332,13 @@ class MemoryAgent(Agent, AgentProtocol):
 - 示例：如果 Observation 返回 {{"long_term": ["用户名字是小明"]}}，则填写 ["用户名字是小明"]
 
 ### storage_result 字段
-- **必须从 store_long_term_memory 工具的 Observation 中提取**
-- stored：只有调用了 store_long_term_memory 工具且 Observation 返回成功时才为 true
-- content：从 Observation 中提取存储的内容，未存储时为空字符串
-- 示例：如果调用 store_long_term_memory 成功，则 {{"stored": true, "content": "用户喜欢喝咖啡"}}
+- **stored**：检查是否调用了 store_long_term_memory 工具
+  - 如果调用了且 Observation 返回 "记忆已保存"，则为 true
+  - 如果没有调用或调用失败，则为 false
+- **content**：从 store_long_term_memory 工具的 **Action Input** 中提取 content 字段值
+  - 注意：不是从 Observation 中提取，而是从调用工具时的输入参数中提取
+  - 未存储时为空字符串
+- 示例：如果 Action Input 是 {{"content": "用户喜欢喝咖啡", ...}} 且存储成功，则 {{"stored": true, "content": "用户喜欢喝咖啡"}}
 
 ## 完整示例
 

@@ -7,12 +7,14 @@ System Agent - 系统调度 Agent
 职责：
 1. 维护对话上下文（_messages）
 2. 通过 ReAct 架构调度子 Agent
-3. 窗口满时触发摘要存储（通过 _on_final_answer 钩子）
+3. 窗口满时触发摘要存储
 
 设计说明：
 - 使用 CallAgentTool 工具调用其他 Agent
 - CallAgentTool 自动注入 conversation_history 到 metadata
-- 通过重写 _on_final_answer 钩子记录会话和触发摘要
+- 通过生命周期钩子管理对话历史：
+  - _on_user_input: 用户输入到达时，记录到 _messages
+  - _on_final_answer: 最终答案生成后，记录回复并触发摘要
 """
 
 import logging
@@ -131,9 +133,6 @@ class SystemAgent(Agent):
         self._user_id = user_id
         self._config = config or SystemConfig()
 
-        # 当前轮次的用户输入（在 _init_loop 中设置）
-        self._current_user_input: str = ""
-
         # 摘要器（懒加载）
         self._summarizer: Optional[ConversationSummarizer] = None
 
@@ -142,6 +141,7 @@ class SystemAgent(Agent):
         from agent.agents.system.tools.call_agent import CallAgentTool
 
         # 先创建一个空的 _messages 列表，供 CallAgentTool 引用
+        # 父类不会覆盖已存在的 _messages
         self._messages: List[Dict[str, Any]] = []
         self._call_tool = CallAgentTool(self._registry, self._messages)
 
@@ -207,24 +207,26 @@ class SystemAgent(Agent):
         """返回工具列表"""
         return [self._call_tool]
 
-    def _init_loop(self, user_input: str):
-        """初始化单轮 ReAct 循环，保存当前用户输入"""
-        self._current_user_input = user_input
-        super()._init_loop(user_input)
+    # ==================== 生命周期钩子实现 ====================
+
+    def _on_user_input(self, user_input: str):
+        """
+        用户输入到达时的回调
+
+        职责：将用户输入添加到 _messages，确保子 Agent 能获取历史对话
+        """
+        now = datetime.now().isoformat()
+        self._messages.append({"role": "user", "content": user_input, "timestamp": now})
 
     def _on_final_answer(self, answer: str):
         """
         最终答案生成后的回调
 
         职责：
-        1. 记录对话到 _messages
+        1. 记录 assistant 回复到 _messages
         2. 裁剪消息（可能触发摘要）
         """
-        # 记录对话
         now = datetime.now().isoformat()
-        self._messages.append(
-            {"role": "user", "content": self._current_user_input, "timestamp": now}
-        )
         self._messages.append(
             {"role": "assistant", "content": answer, "timestamp": now}
         )
@@ -271,7 +273,7 @@ class SystemAgent(Agent):
 
             if success:
                 logger.info("[SystemAgent] 摘要保存成功，清空对话历史")
-                self._messages = []
+                self._messages.clear()  # 使用 clear() 保持引用不变
             else:
                 logger.warning("[SystemAgent] 摘要保存失败")
                 super()._trim_messages()
@@ -310,7 +312,7 @@ class SystemAgent(Agent):
 
     def clear_history(self) -> "SystemAgent":
         """清空对话历史"""
-        self._messages = []
+        self._messages.clear()  # 使用 clear() 保持引用不变
         self._loop_messages = []
         logger.info("[SystemAgent] 对话历史已清空")
         return self
