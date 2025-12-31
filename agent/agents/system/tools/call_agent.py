@@ -64,7 +64,11 @@ class CallAgentTool(CallAgent):
         "required": ["agent_name", "input"],
     }
 
-    def __init__(self, registry: "AgentRegistry", messages_ref: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        messages_ref: List[Dict[str, Any]],
+        registry: str = "AgentRegistry",
+    ):
         """
         初始化
 
